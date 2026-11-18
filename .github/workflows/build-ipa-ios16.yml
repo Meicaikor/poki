@@ -1,0 +1,84 @@
+# Build an unsigned IPA on a GitHub-hosted macOS runner, targeting iOS 16.5.
+name: Build unsigned IPA (iOS 16.5)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        shell: bash
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Rust toolchain (iOS static lib)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Prepare idevice checkout
+        shell: bash
+        run: bash native/launcher/fetch-idevice.sh
+
+      - name: Build PokiLauncher static library
+        shell: bash
+        run: |
+          cargo build --release --locked \
+            --target aarch64-apple-ios \
+            --manifest-path native/launcher/Cargo.toml
+          ls -la native/launcher/target/aarch64-apple-ios/release/libpoki_launcher.a
+
+      - name: Generate assets
+        shell: bash
+        run: bash native/ios-app/scripts/make-assets.sh
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate --spec native/ios-app/project.yml
+          xcodegen generate --spec native/ios-app/project-external.yml
+
+      - name: Build external edition (unsigned, Release, iOS 16.5)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d ' \n' < native/ios-app/VERSION)"
+          BUILD="${GITHUB_RUN_NUMBER}"
+          mkdir -p build out
+          xcodebuild build \
+            -project "native/ios-app/PokiExternal.xcodeproj" \
+            -scheme Poki -configuration Release \
+            -destination generic/platform=iOS \
+            -derivedDataPath "build/app-external" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 IPHONEOS_DEPLOYMENT_TARGET=16.5 \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD" \
+            2>&1 | tee "build/app-external.log" | \
+            grep --line-buffered -E "error:|BUILD (SUCCEEDED|FAILED)|\*\* "
+          test -d "build/app-external/Build/Products/Release-iphoneos/Poki.app"
+          native/ios-app/scripts/package-app.sh \
+            "build/app-external/Build/Products/Release-iphoneos/Poki.app" \
+            external "out/Poki-external-unsigned.ipa" "$VERSION" "$BUILD"
+          (cd out && shasum -a 256 *.ipa | tee SHA256SUMS)
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' \
+            "build/app-external/Build/Products/Release-iphoneos/Poki.app/Info.plist"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Poki-unsigned-iOS16
+          path: out/
+          if-no-files-found: error
